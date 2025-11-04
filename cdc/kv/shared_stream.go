@@ -234,9 +234,9 @@ func (s *requestedStream) receive(
 				zap.String("addr", rs.storeAddr),
 				zap.String("code", grpcstatus.Code(err).String()),
 				zap.Error(err))
-			if sharedconn.StatusIsEOF(grpcstatus.Convert(err)) {
-				return nil
-			}
+			// if sharedconn.StatusIsEOF(grpcstatus.Convert(err)) {
+			// 	return nil
+			// }
 			return errors.Trace(err)
 		}
 		if len(cevent.Events) > 0 {
