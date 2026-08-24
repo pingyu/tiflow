@@ -545,9 +545,26 @@ func (s *Syncer) Init(ctx context.Context) (err error) {
 		metricProxies.Init(s.cfg.MetricsFactory)
 	}
 	s.metricsProxies = metricProxies.CacheForOneTask(s.cfg.Name, s.cfg.WorkerName, s.cfg.SourceID)
+	s.updateSyncerBinlogMetrics(s.checkpoint.GlobalPoint())
 
 	s.ddlWorker = NewDDLWorker(&s.tctx.Logger, s)
 	return nil
+}
+
+func (s *Syncer) updateSyncerBinlogMetrics(checkpoint binlog.Location) {
+	s.metricsProxies.Metrics.BinlogSyncerPosGauge.Set(float64(checkpoint.Position.Pos))
+
+	index, err := utils.GetFilenameIndex(checkpoint.Position.Name)
+	if err != nil {
+		// An empty binlog filename is expected for a fresh or GTID-only checkpoint.
+		// Use NaN so the unknown file number is not exposed as a valid zero value.
+		s.metricsProxies.Metrics.BinlogSyncerFileGauge.Set(math.NaN())
+		if checkpoint.Position.Name != "" {
+			s.tctx.L().Warn("fail to get index number of checkpoint binlog file", log.ShortError(err))
+		}
+		return
+	}
+	s.metricsProxies.Metrics.BinlogSyncerFileGauge.Set(float64(index))
 }
 
 // buildLowerCaseTableNamesMap build a lower case schema map and lower case table map for all tables
@@ -1837,6 +1854,11 @@ func (s *Syncer) Run(ctx context.Context) (err error) {
 	if err != nil {
 		return err
 	}
+	// Init initializes metrics for tasks that do not enter Run. Refresh them
+	// here because Run may select a different checkpoint from start time or
+	// metadata, and GTID adjustment may further update the global checkpoint.
+	s.updateSyncerBinlogMetrics(s.checkpoint.GlobalPoint())
+
 	if fresh && config.HasLoad(s.cfg.Mode) {
 		delLoadTask = true
 		flushCheckpoint = true
@@ -3401,6 +3423,12 @@ func (s *Syncer) CheckCanUpdateCfg(newCfg *config.SubTaskConfig) error {
 	if err := config.CheckForeignKeyChecksSyncerOptions(newCfg.To.Session, newCfg.SyncerConfig); err != nil {
 		return err
 	}
+	if s.cfg.SyncerConfig.SafeMode != newCfg.SyncerConfig.SafeMode {
+		return terror.ErrWorkerUpdateSubTaskConfig.Generatef(
+			"can't update safe-mode for syncer because it requires reinitialization, task: %s",
+			s.cfg.Name,
+		)
+	}
 	// can't update when in sharding merge
 	if s.cfg.ShardMode == config.ShardPessimistic {
 		_, tables := s.sgk.UnresolvedTables()
@@ -3410,6 +3438,12 @@ func (s *Syncer) CheckCanUpdateCfg(newCfg *config.SubTaskConfig) error {
 	}
 	if err := s.checkForeignKeyCausalityConfigUpdate(newCfg); err != nil {
 		return err
+	}
+	if config.IsForeignKeyChecksEnabled(s.cfg.To.Session) != config.IsForeignKeyChecksEnabled(newCfg.To.Session) {
+		return terror.ErrWorkerUpdateSubTaskConfig.Generatef(
+			"can't update foreign_key_checks for syncer because it requires reinitialization, task: %s",
+			s.cfg.Name,
+		)
 	}
 
 	oldCfg, err := s.cfg.Clone()
@@ -3903,16 +3937,6 @@ func (s *Syncer) precheckForeignKeyReferencedTables(
 	return nil
 }
 
-func basicDownStreamTableInfo(dti *schema.DownstreamTableInfo) *schema.DownstreamTableInfo {
-	if dti == nil {
-		return nil
-	}
-	return &schema.DownstreamTableInfo{
-		TableInfo:   dti.TableInfo,
-		WhereHandle: dti.WhereHandle,
-	}
-}
-
 func (s *Syncer) prepareDownStreamTableInfo(
 	tctx *tcontext.Context,
 	sourceTable *filter.Table,
@@ -3929,7 +3953,7 @@ func (s *Syncer) prepareDownStreamTableInfo(
 	}
 
 	if !s.needForeignKeyCausality() {
-		return basicDownStreamTableInfo(dti), nil
+		return dti.WithoutForeignKeyRelations(), nil
 	}
 	if err := s.precheckForeignKeyRouteTopology(tctx.Ctx); err != nil {
 		return nil, err

@@ -2049,6 +2049,33 @@ func TestCheckCanUpdateCfg(t *testing.T) {
 	require.NoError(t, syncer.CheckCanUpdateCfg(cfg))
 }
 
+func TestCheckCanUpdateCfgRejectsTimezoneChange(t *testing.T) {
+	cfg := genDefaultSubTaskConfig4Test()
+	cfg.Timezone = "UTC"
+	syncer := NewSyncer(cfg, nil, nil)
+
+	newCfg := cloneSubTaskConfigForSyncerTest(t, cfg)
+	newCfg.Timezone = "Asia/Shanghai"
+	err := syncer.CheckCanUpdateCfg(newCfg)
+	require.Truef(t, terror.ErrWorkerUpdateSubTaskConfig.Equal(err), "err: %v", err)
+	require.ErrorContains(t, err, "fields that should not be changed")
+}
+
+func TestCheckCanUpdateCfgRejectsSafeModeChange(t *testing.T) {
+	for _, oldSafeMode := range []bool{false, true} {
+		cfg := genDefaultSubTaskConfig4Test()
+		cfg.SyncerConfig.SafeMode = oldSafeMode
+		syncer := NewSyncer(cfg, nil, nil)
+		newCfg, err := cfg.Clone()
+		require.NoError(t, err)
+		newCfg.SyncerConfig.SafeMode = !oldSafeMode
+
+		err = syncer.CheckCanUpdateCfg(newCfg)
+		require.Truef(t, terror.ErrWorkerUpdateSubTaskConfig.Equal(err), "err: %v", err)
+		require.ErrorContains(t, err, "safe-mode")
+	}
+}
+
 func TestCheckCanUpdateCfgRejectsForeignKeyChecksDMLBoundaryOptions(t *testing.T) {
 	cfg := genDefaultSubTaskConfig4Test()
 	syncer := NewSyncer(cfg, nil, nil)
@@ -2087,6 +2114,57 @@ func TestCheckCanUpdateCfgRejectsForeignKeyChecksDMLBoundaryOptions(t *testing.T
 	newCfg.SyncerConfig.Compact = true
 	newCfg.SyncerConfig.MultipleRows = true
 	require.NoError(t, syncer.CheckCanUpdateCfg(newCfg))
+}
+
+func TestCheckCanUpdateCfgTargetSession(t *testing.T) {
+	testCases := []struct {
+		name    string
+		old     map[string]string
+		new     map[string]string
+		allowed bool
+	}{
+		{name: "omitted and explicit default", old: nil, new: map[string]string{"FOREIGN_KEY_CHECKS": "0"}, allowed: true},
+		{
+			name: "runtime derived session difference",
+			old: map[string]string{
+				"foreign_key_checks": "1",
+				"sql_mode":           "ANSI_QUOTES",
+				"tidb_txn_mode":      "optimistic",
+			},
+			new: map[string]string{
+				"foreign_key_checks": "1",
+				"tidb_txn_mode":      "optimistic",
+			},
+			allowed: true,
+		},
+		{
+			name:    "legacy enabled value and canonical one",
+			old:     map[string]string{"foreign_key_checks": "ON"},
+			new:     map[string]string{"FOREIGN_KEY_CHECKS": "1"},
+			allowed: true,
+		},
+		{name: "foreign key checks changed", old: nil, new: map[string]string{"foreign_key_checks": "1"}},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			oldCfg := genDefaultSubTaskConfig4Test()
+			oldCfg.SyncerConfig.WorkerCount = 1
+			oldCfg.To.Session = testCase.old
+			syncer := NewSyncer(oldCfg, nil, nil)
+
+			newCfg, err := oldCfg.Clone()
+			require.NoError(t, err)
+			newCfg.To.Session = testCase.new
+			err = syncer.CheckCanUpdateCfg(newCfg)
+			if testCase.allowed {
+				require.NoError(t, err)
+				return
+			}
+			require.Truef(t, terror.ErrWorkerUpdateSubTaskConfig.Equal(err), "err: %v", err)
+			require.ErrorContains(t, err, "foreign_key_checks")
+		})
+	}
 }
 
 func TestUpdateRejectsForeignKeyChecksDMLBoundaryOptions(t *testing.T) {
